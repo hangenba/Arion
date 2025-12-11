@@ -33,7 +33,7 @@ func main() {
 	reader := bufio.NewReader(os.Stdin)
 	fmt.Println("-----------------MENU--------------------")
 	fmt.Println("请选择要运行的任务：")
-	fmt.Println("  1. Three Matrices Multiply Test (logN=10)")
+	fmt.Println("  1. Three Matrices Multiply Test (logN=13)")
 	fmt.Println("  2. Ciphertext matrix multiply Plaintext matrix")
 	fmt.Println("  3. Bert test function ")
 	fmt.Println("  4. Bert Inference with Tiny parameters (logN=6, rows=8, batch=4)")
@@ -63,8 +63,8 @@ func main() {
 		runThreeMatricMultiply(13, 64, 64)
 		runThreeMatricMultiply(13, 128, 64)
 		runThreeMatricMultiply(13, 256, 64)
-		// runThreeMatricMultiply(13, 128, 64)
-		// runThreeMatricMultiply(13, 128, 128)
+		// runThreeMatricMultiplyMT(13, 128, 64)
+		// runThreeMatricMultiplyMT(13, 128, 128)
 
 	case 2:
 		bert.TestCiphertextMatricesMultiplyWeightAndAddBiasMT("base", 128, "bert_base_data_5")
@@ -696,8 +696,8 @@ func runThreeMatricMultiply(LogN, numRow, numCol int) {
 
 	ecd, enc, eval, dec := he.GenerateKeys(ckksParams, modelParams)
 
-	matmul.RunThreeMatricMultiplyNormalMT(modelParams, ckksParams, ecd, enc, eval, dec)
-	matmul.RunThreeMatricMultiplyBSGSMT(modelParams, ckksParams, ecd, enc, eval, dec)
+	matmul.RunThreeMatricMultiplyNormal(modelParams, ckksParams, ecd, enc, eval, dec)
+	matmul.RunThreeMatricMultiplyBSGS(modelParams, ckksParams, ecd, enc, eval, dec)
 }
 
 func runThreeMatricMultiplyMT(LogN, numRow, numCol int) {

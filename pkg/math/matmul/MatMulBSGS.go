@@ -479,71 +479,96 @@ func CiphertextMatrixMultiplyCiphertextMatrixToHalveiShoupBSGSMT(
 	qRot := matrix.RotateCiphertextMatricesMT(ctQ, giantSteps, eval, numThreads)
 	kRot := matrix.RotateCiphertextMatricesMT(ctK, babySteps, eval, numThreads)
 
+	/* -------- 核心计算: BSGS 乘法 (Phase 2) -------- */
+	// 这里使用 Worker Pool 模式，解决 GiantStep < NumThreads 导致的负载不均问题
+
+	// 1. 准备结果容器
 	res := make([]*rlwe.Ciphertext, rows)
 
-	/* -------- 线程层级 -------- */
-	T1 := giant // 外层 ≤ giantStep
-	if T1 > numThreads {
-		T1 = numThreads
+	// 2. 定义任务结构 (Giant索引, Baby索引, 结果数组的目标索引)
+	type workTask struct {
+		gIdx      int // index in qRot
+		bIdx      int // index in kRot
+		targetRow int // index in res
 	}
-	if T1 == 0 {
-		T1 = 1
-	}
-	T2 := numThreads / T1 // 内层
-	if T2 == 0 {
-		T2 = 1
-	}
+
+	// 3. 创建通道
+	// taskChan 缓冲设为 rows，足以容纳所有任务，避免发送阻塞
+	taskChan := make(chan workTask, rows)
+	errChan := make(chan error, 1) // 用于捕获错误
 
 	var wg sync.WaitGroup
-	var mu sync.Mutex
 
-	for g := 0; g < T1; g++ {
+	// 4. 启动 Workers (消费者)
+	// 无论 giantStep 是多少，这里都会启动 numThreads 个协程全力工作
+	for w := 0; w < numThreads; w++ {
 		wg.Add(1)
-		go func(gid int) {
+		go func() {
 			defer wg.Done()
-			lEval := eval.ShallowCopy()
-			for gi := gid; gi < giant; gi += T1 {
 
-				// -------- babyStep 级别 --------
-				var gWg sync.WaitGroup
-				chunk := (baby + T2 - 1) / T2
+			// [关键] 每个线程拥有独立的 Evaluator，避免内存竞争
+			localEval := eval.ShallowCopy()
 
-				for t := 0; t < T2; t++ {
-					l := t * chunk
-					r := (t + 1) * chunk
-					if l >= r || l >= baby {
-						continue
-					}
-					if r > baby {
-						r = baby
-					}
-
-					gWg.Add(1)
-					go func(l, r, gi int) {
-						defer gWg.Done()
-						le := lEval.ShallowCopy()
-						localQRot := qRot[gi].CopyNew()
-						for bj := l; bj < r; bj++ {
-							localKRot := kRot[bj].CopyNew()
-							row := gi*baby + bj
-							if row >= rows {
-								break
-							}
-
-							ct, _ := matrix.CiphertextMatricesMultiplyCiphertextMatricesThenAdd(
-								localQRot, localKRot, &params, le)
-
-							mu.Lock()
-							res[row] = ct
-							mu.Unlock()
-						}
-					}(l, r, gi)
+			for task := range taskChan {
+				// 如果已有报错，停止处理后续任务 (可选优化)
+				if len(errChan) > 0 {
+					continue
 				}
-				gWg.Wait()
+
+				// 执行矩阵乘法累加
+				// 注意：这里使用 qRot[task.gIdx] 和 kRot[task.bIdx]
+				val, err := matrix.CiphertextMatricesMultiplyCiphertextMatricesThenAdd(
+					qRot[task.gIdx],
+					kRot[task.bIdx],
+					&params, // 注意这里取地址，因为函数定义通常需要指针
+					localEval,
+				)
+
+				if err != nil {
+					// 尝试记录第一个错误
+					select {
+					case errChan <- err:
+					default:
+					}
+					continue
+				}
+
+				// [关键] 无锁写入
+				// 因为每个 task.targetRow 是唯一的，所以这里不需要 Mutex
+				res[task.targetRow] = val
 			}
-		}(g)
+		}()
 	}
-	wg.Wait()
+
+	// 5. 分发任务 (生产者)
+	// 将双层循环打平成线性任务流
+	// Logic: for i in giant, for j in baby -> task
+ProducerLoop:
+	for i := 0; i < giant; i++ {
+		for j := 0; j < baby; j++ {
+			row := i*baby + j
+
+			// 边界检查：如果计算出的行号超出了实际行数，停止分发
+			if row >= rows {
+				break ProducerLoop
+			}
+
+			taskChan <- workTask{
+				gIdx:      i,
+				bIdx:      j,
+				targetRow: row,
+			}
+		}
+	}
+
+	// 6. 等待完成
+	close(taskChan) // 关闭通道，通知 worker 没有新任务了
+	wg.Wait()       // 等待所有 worker 退出
+
+	// 7. 检查错误
+	if len(errChan) > 0 {
+		return nil, <-errChan
+	}
 
 	return &he.CiphertextMatrices{
 		Ciphertexts: res,
@@ -556,133 +581,219 @@ func CiphertextMatrixMultiplyCiphertextMatrixToHalveiShoupBSGSMT(
 // (QKᵀ) · V   ——  二级并行  (giantStep × babyStep)
 func CiphertextMatrixHSMultiplyCiphertextMatrixBSGSMT(
 	ctQKT, ctV *he.CiphertextMatrices,
-	mp *configs.ModelParams,
-	params ckks.Parameters,
+	modelParams *configs.ModelParams,
+	ckksParams ckks.Parameters,
 	eval *ckks.Evaluator,
 	numThreads int,
 ) (*he.CiphertextMatrices, error) {
+	ctRows := ctV.NumRow
+	ctCols := ctV.NumCol
+	ctBatch := ctV.NumBatch
 
-	rows, cols := ctV.NumRow, ctV.NumCol
-	baby, giant, base := mp.BabyStep, mp.GiantStep, mp.NumBatch
+	babyStep := modelParams.BabyStep
+	giantStep := modelParams.GiantStep
+	baseLen := modelParams.NumBatch
 
-	/* 基本检查 */
-	if ctQKT.NumBatch != ctV.NumBatch || ctQKT.NumCol != ctV.NumRow {
-		return nil, fmt.Errorf("dimension mismatch QKT(%d,%d) vs V(%d,%d)",
-			ctQKT.NumBatch, ctQKT.NumCol, ctV.NumRow, ctV.NumCol)
+	// 1. 基础检查
+	if ctQKT.NumBatch != ctV.NumBatch {
+		return nil, fmt.Errorf("ctQKT and ctV must have the same Batch")
+	}
+	if ctQKT.NumCol != ctV.NumRow {
+		return nil, fmt.Errorf("ctQKT Cols must equal ctV Row")
 	}
 
-	/* 预旋转 V */
-	babySteps := make([]int, baby)
+	// startTime := time.Now()
+
+	// 2. 预处理：并行生成所有 BabyStep 的旋转矩阵
+	// 使用之前的多线程旋转函数，或者在这里原地并行
+	babySteps := make([]int, babyStep)
 	for i := range babySteps {
-		babySteps[i] = i * base
+		babySteps[i] = i * baseLen
 	}
-	vRot := matrix.RotateCiphertextMatricesMT(ctV, babySteps, eval, numThreads)
+	// 假设你已经有 matrix.RotateCiphertextMatricesMT，如果没有，请保留原有的循环但加上 goroutine
+	ctVRotated := matrix.RotateCiphertextMatricesMT(ctV, babySteps, eval, numThreads)
 
-	out := make([]*rlwe.Ciphertext, cols)
-	for k := range out {
-		out[k] = ckks.NewCiphertext(params, ctQKT.Ciphertexts[0].Degree(), ctQKT.Ciphertexts[0].Level())
-	}
+	// fmt.Printf("rot time:%s\n", time.Since(startTime))
 
-	/* 线程层级 */
-	T1 := giant
-	if T1 > numThreads {
-		T1 = numThreads
-	}
-	if T1 == 0 {
-		T1 = 1
-	}
-	T2 := numThreads / T1
-	if T2 == 0 {
-		T2 = 1
-	}
+	// -----------------------------------------------------------------
+	// 核心优化开始：使用中间桶 (Intermediate Buckets) 解决 GiantStep < Threads
+	// -----------------------------------------------------------------
 
-	var wg sync.WaitGroup
-	var mu sync.Mutex
+	// 准备中间容器：intermediate[giantIndex][colIndex]
+	// 对应单线程代码中的 ctQKV，但我们需要 giantStep 个这样的容器
+	intermediate := make([][]*rlwe.Ciphertext, giantStep)
+	interLocks := make([]sync.Mutex, giantStep) // 每个 giantStep 一把锁
 
-	for g := 0; g < T1; g++ {
-		wg.Add(1)
-		go func(gid int) {
-			defer wg.Done()
-			lEval := eval.ShallowCopy()
-
-			// thread-local 累加器
-			localSum := func() []*rlwe.Ciphertext {
-				cs := make([]*rlwe.Ciphertext, cols)
-				for k := range cs {
-					cs[k] = ckks.NewCiphertext(params,
-						ctQKT.Ciphertexts[0].Degree(), ctQKT.Ciphertexts[0].Level())
-				}
-				return cs
+	// 初始化中间容器 (并行初始化，因为 NewCiphertext 也有开销)
+	var initWg sync.WaitGroup
+	initWg.Add(giantStep)
+	for i := 0; i < giantStep; i++ {
+		go func(gIdx int) {
+			defer initWg.Done()
+			intermediate[gIdx] = make([]*rlwe.Ciphertext, ctCols)
+			for k := 0; k < ctCols; k++ {
+				intermediate[gIdx][k] = ckks.NewCiphertext(ckksParams, ctQKT.Ciphertexts[0].Degree(), ctQKT.Ciphertexts[0].Level())
 			}
-
-			for gi := gid; gi < giant; gi += T1 {
-				tmp := localSum()
-
-				/* 内层 baby 并行 */
-				var gWg sync.WaitGroup
-				chunk := (baby + T2 - 1) / T2
-
-				for t := 0; t < T2; t++ {
-					l := t * chunk
-					r := (t + 1) * chunk
-					if l >= r || l >= baby {
-						continue
-					}
-					if r > baby {
-						r = baby
-					}
-
-					gWg.Add(1)
-					go func(l, r, gi int, acc []*rlwe.Ciphertext) {
-						defer gWg.Done()
-						le := lEval.ShallowCopy()
-
-						localMat := &he.CiphertextMatrices{
-							Ciphertexts: make([]*rlwe.Ciphertext, cols),
-							NumBatch:    ctV.NumBatch,
-							NumRow:      rows,
-							NumCol:      cols,
-						}
-						for k := 0; k < cols; k++ {
-							localMat.Ciphertexts[k] = ckks.NewCiphertext(params,
-								ctQKT.Ciphertexts[0].Degree(), ctQKT.Ciphertexts[0].Level())
-						}
-
-						for bj := l; bj < r; bj++ {
-							localVrot := vRot[bj].CopyNew()
-							row := gi*baby + bj
-							if row >= rows {
-								break
-							}
-
-							_ = matrix.CiphertextMatricesMultiplyCiphertextAddToRes(
-								localVrot, ctQKT.Ciphertexts[row], localMat, &params, le)
-						}
-
-						rot := matrix.RotateCiphertextMatrices(localMat, gi*base*baby, le)
-						for k := 0; k < cols; k++ {
-							le.Add(acc[k], rot.Ciphertexts[k], acc[k])
-						}
-
-					}(l, r, gi, tmp)
-				}
-				gWg.Wait()
-
-				// merge giant-level partial sum
-				mu.Lock()
-				for k := 0; k < cols; k++ {
-					eval.Add(out[k], tmp[k], out[k])
-				}
-				mu.Unlock()
-			}
-		}(g)
+		}(i)
 	}
-	wg.Wait()
+	initWg.Wait()
+
+	// 定义 Phase 1 的任务
+	type calcTask struct {
+		gIdx int // giant step index (i)
+		bIdx int // baby step index (j)
+		row  int // pre-calculated row index
+	}
+
+	taskChan := make(chan calcTask, ctRows) // 缓冲足够大
+	errChan := make(chan error, 1)
+
+	var workerWg sync.WaitGroup
+
+	// -----------------------------------------------------------------
+	// Phase 1: 并行乘法 (Multiplication) & 分桶累加 (Bucket Accumulation)
+	// -----------------------------------------------------------------
+	// 启动 Worker 池 (充分利用 numThreads)
+	for w := 0; w < numThreads; w++ {
+		workerWg.Add(1)
+		go func() {
+			defer workerWg.Done()
+			localEval := eval.ShallowCopy() // 线程独享 evaluator
+
+			for task := range taskChan {
+				if len(errChan) > 0 {
+					continue
+				}
+
+				// 1. 创建临时容器存放本次乘法结果 (避免直接操作共享的 intermediate)
+				// 这里创建一个临时的 Matrix 结构来适配接口
+				tmpResCiphertexts := make([]*rlwe.Ciphertext, ctCols)
+				for k := 0; k < ctCols; k++ {
+					// 注意：这里必须是新的 Ciphertext，或者是被置零的
+					tmpResCiphertexts[k] = ckks.NewCiphertext(ckksParams, ctQKT.Ciphertexts[0].Degree(), ctQKT.Ciphertexts[0].Level())
+				}
+				tmpCtQKV := &he.CiphertextMatrices{
+					Ciphertexts: tmpResCiphertexts,
+					NumBatch:    ctBatch,
+					NumRow:      ctRows,
+					NumCol:      ctCols,
+				}
+
+				// 2. 执行计算：tmp = ctVRotated[j] * ctQKT[row]
+				// 对应原代码：matrix.CiphertextMatricesMultiplyCiphertextAddToRes(...)
+				err := matrix.CiphertextMatricesMultiplyCiphertextAddToRes(
+					ctVRotated[task.bIdx],
+					ctQKT.Ciphertexts[task.row],
+					tmpCtQKV,
+					&ckksParams,
+					localEval,
+				)
+
+				if err != nil {
+					select {
+					case errChan <- err:
+					default:
+					}
+					continue
+				}
+
+				// 3. 累加到对应的 Giant 桶 (Critical Section)
+				// 虽然加锁了，但因为计算(上一步)很慢，加锁(这一步)很快，所以冲突极小
+				interLocks[task.gIdx].Lock()
+				for k := 0; k < ctCols; k++ {
+					// intermediate[gIdx] += tmpRes
+					localEval.Add(intermediate[task.gIdx][k], tmpResCiphertexts[k], intermediate[task.gIdx][k])
+				}
+				interLocks[task.gIdx].Unlock()
+			}
+		}()
+	}
+
+	// 分发任务：打平双层循环
+	for i := 0; i < giantStep; i++ {
+		for j := 0; j < babyStep; j++ {
+			row := i*babyStep + j
+			if row >= ctRows {
+				break
+			}
+			taskChan <- calcTask{
+				gIdx: i,
+				bIdx: j,
+				row:  row,
+			}
+		}
+	}
+	close(taskChan)
+	workerWg.Wait() // 等待 Phase 1 完成
+
+	if len(errChan) > 0 {
+		return nil, <-errChan
+	}
+
+	// -----------------------------------------------------------------
+	// Phase 2: 并行旋转 (Rotation) & 最终合并 (Final Merge)
+	// -----------------------------------------------------------------
+	// 现在 intermediate[i] 已经包含了第 i 个 giant step 的完整 Sum(V * Q)，只差旋转了。
+
+	newCiphertexts := make([]*rlwe.Ciphertext, ctCols)
+	// 初始化结果容器
+	for k := 0; k < ctCols; k++ {
+		newCiphertexts[k] = ckks.NewCiphertext(ckksParams, ctQKT.Ciphertexts[0].Degree(), ctQKT.Ciphertexts[0].Level())
+	}
+
+	// 为了最终写入安全，给每列一把锁 (或者使用原子操作，但FHE对象通常用锁)
+	finalLocks := make([]sync.Mutex, ctCols)
+
+	var rotWg sync.WaitGroup
+
+	// 简单的并行：遍历每个 giant step
+	// 这里的任务数是 giantStep。如果 giantStep < numThreads，这里可能跑不满。
+	// 但因为旋转比乘法快得多，且这是收尾阶段，通常可以接受。
+	// 如果想极致优化，可以将 (giantStep * ctCols) 打平。下面演示打平版本：
+
+	rotTaskChan := make(chan int, giantStep) // 只传 giant index
+
+	for w := 0; w < numThreads; w++ {
+		rotWg.Add(1)
+		go func() {
+			defer rotWg.Done()
+			localEval := eval.ShallowCopy()
+
+			for i := range rotTaskChan {
+				// 构造临时的 CiphertextMatrices 以复用 Rotate 接口
+				localMat := &he.CiphertextMatrices{
+					Ciphertexts: intermediate[i],
+					NumBatch:    ctBatch,
+					NumRow:      ctRows,
+					NumCol:      ctCols,
+				}
+
+				// 旋转：Rotate(intermediate[i], i * baseLen * babyStep)
+				// 对应原代码：QKVRotKi := matrix.RotateCiphertextMatrices(...)
+				rotStep := i * baseLen * babyStep
+				QKVRotKi := matrix.RotateCiphertextMatrices(localMat, rotStep, localEval)
+
+				// 累加到最终结果
+				for k := 0; k < ctCols; k++ {
+					finalLocks[k].Lock()
+					localEval.Add(newCiphertexts[k], QKVRotKi.Ciphertexts[k], newCiphertexts[k])
+					finalLocks[k].Unlock()
+				}
+			}
+		}()
+	}
+
+	// 分发 Phase 2 任务
+	for i := 0; i < giantStep; i++ {
+		rotTaskChan <- i
+	}
+	close(rotTaskChan)
+	rotWg.Wait()
 
 	return &he.CiphertextMatrices{
-		Ciphertexts: out,
-		NumBatch:    ctV.NumBatch,
-		NumRow:      rows,
-		NumCol:      cols,
+		Ciphertexts: newCiphertexts,
+		NumBatch:    ctBatch,
+		NumRow:      ctRows,
+		NumCol:      ctCols,
 	}, nil
 }

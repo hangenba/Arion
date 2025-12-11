@@ -1,0 +1,11 @@
+{
+  "num_labels": 2,
+  "id2label": {
+    "0": "LABEL_0",
+    "1": "LABEL_1"
+  },
+  "label2id": {
+    "LABEL_0": 0,
+    "LABEL_1": 1
+  }
+}

@@ -59,26 +59,26 @@ func main() {
 	switch choice {
 	case 1:
 		// 最好单独测试每一个类型
-		// runThreeMatricMultiply(13, 32, 64)
-		// runThreeMatricMultiply(13, 64, 64)
-		// runThreeMatricMultiply(13, 128, 64)
-		// runThreeMatricMultiply(13, 256, 64)
+		runThreeMatricMultiply(13, 32, 64)
+		runThreeMatricMultiply(13, 64, 64)
 		runThreeMatricMultiply(13, 128, 64)
-		runThreeMatricMultiply(13, 128, 128)
+		runThreeMatricMultiply(13, 256, 64)
+		// runThreeMatricMultiply(13, 128, 64)
+		// runThreeMatricMultiply(13, 128, 128)
 
 	case 2:
-		bert.TestCiphertextMatricesMultiplyWeightAndAddBiasMT("short", 128, "bert_base_data")
+		bert.TestCiphertextMatricesMultiplyWeightAndAddBiasMT("base", 128, "bert_base_data_5")
 	case 3:
 		CiphertextInferenceBertSelfAttention() // 计算结果正确
 		// CiphertextInferenceSelfOutput() // 计算结果正确
 		// CiphertextInferenceBertIntermediate() // 计算结果正确，但是Gelu函数的degree是255，且在0点附近的精确度不够
 		// CiphertextInferenceBertOutput() // 计算结果正确
 	case 4:
-		bert.InferenceBert("tiny", 8, "bert_base_data")
+		bert.InferenceBert("tiny", 8, "bert_base_data_5")
 	case 5:
-		bert.InferenceBert("short", 128, "bert_base_data")
+		bert.InferenceBert("short", 128, "bert_base_data_5")
 	case 6:
-		bert.InferenceBert("base", 128, "bert_base_data")
+		bert.InferenceBert("base", 128, "bert_base_data_5")
 	case 7:
 		CiphertextInferenceBertTinySelfAttention() // 计算结果正确
 		// CiphertextInferenceBertTinySelfOutput() // 计算结果正确
@@ -120,7 +120,7 @@ func CiphertextInferenceBertSelfAttention() {
 	fmt.Println("----------Task: BERT Model Inference Under The CKKS Scheme Attention----------")
 
 	// Step 1. Generate the model parameters and configurations
-	ckksParams, btpParams, modelParams, err := configs.InitBert("short", 128, "bert_base_data")
+	ckksParams, btpParams, modelParams, err := configs.InitBert("short", 128, "bert_base_data_5")
 	if err != nil {
 		panic(err)
 	}
@@ -204,7 +204,7 @@ func CiphertextInferenceSelfOutput() {
 	fmt.Println("----------Task: BERT Model Inference Under The CKKS Scheme SelfOutput----------")
 
 	// Step 1. Generate the model parameters and configurations
-	ckksParams, _, modelParams, err := configs.InitBert("short", 128, "bert_base_data")
+	ckksParams, _, modelParams, err := configs.InitBert("short", 128, "bert_base_data_5")
 	if err != nil {
 		panic(err)
 	}
@@ -307,7 +307,7 @@ func CiphertextInferenceBertIntermediate() {
 	fmt.Println("----------Task: BERT Model Inference Under The CKKS Scheme Intermediate----------")
 
 	// Step 1. Generate the model parameters and configurations
-	ckksParams, _, modelParams, err := configs.InitBert("tiny", 8, "bert_base_data")
+	ckksParams, _, modelParams, err := configs.InitBert("tiny", 8, "bert_base_data_5")
 	if err != nil {
 		panic(err)
 	}
@@ -376,7 +376,7 @@ func CiphertextInferenceBertOutput() {
 	fmt.Println("----------Task: BERT Model Inference Under The CKKS Scheme Output----------")
 
 	// Step 1. Generate the model parameters and configurations
-	ckksParams, _, modelParams, err := configs.InitBert("tiny", 8, "bert_base_data")
+	ckksParams, _, modelParams, err := configs.InitBert("tiny", 8, "bert_base_data_5")
 	if err != nil {
 		panic(err)
 	}
@@ -1107,7 +1107,7 @@ func TestOperation() {
 	fmt.Println("----------Task: Testing Operation ----------")
 
 	// Step 1. Generate the model parameters and configurations
-	ckksParams, btpParams, modelParams, err := configs.InitBert("base", 8, "bert_base_data")
+	ckksParams, btpParams, modelParams, err := configs.InitBert("base", 8, "bert_base_data_5")
 	if err != nil {
 		panic(err)
 	}

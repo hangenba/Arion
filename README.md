@@ -20,6 +20,7 @@ Core to Arion is the **Double Baby-Step Giant-Step (Double-BSGS)** algorithm, wh
 * **Hardware Requirements**:
     * For **Tiny/Short** parameters: Standard CPU/RAM, At least**20GB+ RAM**.
     * For **Base** parameters ($N=2^{16}$): At least **600GB+ RAM** is recommended due to large key sizes. -->
+    
 
 ## 📦 Installation
 
